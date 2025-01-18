@@ -257,7 +257,7 @@ def load_model(
 
     dtype = torch.float32 if mel_spec_type == "bigvgan" else None
     model = load_checkpoint(model, ckpt_path, device, dtype=dtype, use_ema=use_ema)
-
+    model = model.half()  # Convert to float16
     return model
 
 
