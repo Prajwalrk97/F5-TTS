@@ -45,7 +45,7 @@ DEFAULT_TTS_MODEL = "F5-TTS"
 tts_model_choice = DEFAULT_TTS_MODEL
 
 DEFAULT_TTS_MODEL_CFG = [
-    r"C:\F5-TTS\ckpts\arsene_wenger_tts\model_160000.safetensors",
+    "hf://prajwalrk/arsene-wenger-tts/model_160000.safetensors",
     "hf://SWivid/F5-TTS/F5TTS_Base/vocab.txt",
     json.dumps(dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)),
 ]
@@ -56,12 +56,12 @@ DEFAULT_TTS_MODEL_CFG = [
 vocoder = load_vocoder()
 
 
-def load_f5tts(ckpt_path=r"C:\F5-TTS\ckpts\arsene_wenger_tts\model_160000.safetensors"):
+def load_f5tts(ckpt_path=str(cached_path("hf://prajwalrk/arsene-wenger-tts/model_160000.safetensors"))):
     F5TTS_model_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
     return load_model(DiT, F5TTS_model_cfg, ckpt_path)
 
 
-def load_e2tts(ckpt_path=r"C:\F5-TTS\ckpts\arsene_wenger_tts\model_160000.safetensors"):
+def load_e2tts(ckpt_path=str(cached_path("hf://prajwalrk/arsene-wenger-tts/model_160000.safetensors"))):
     E2TTS_model_cfg = dict(dim=1024, depth=24, heads=16, ff_mult=4)
     return load_model(UNetT, E2TTS_model_cfg, ckpt_path)
 

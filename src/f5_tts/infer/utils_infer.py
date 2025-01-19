@@ -1,5 +1,6 @@
 # A unified script for inference process
 # Make adjustments inside functions, and consider both gradio and cli scripts if need to change func output format
+from collections import OrderedDict
 import os
 import sys
 
@@ -545,3 +546,16 @@ def save_spectrogram(spectrogram, path):
     plt.colorbar()
     plt.savefig(path)
     plt.close()
+
+
+# Load predefined speech types from a directory
+
+def load_speech_types(speech_types_dir):
+    speech_types = OrderedDict()
+    for filename in os.listdir(speech_types_dir):
+        if filename.endswith(".wav"):
+            speech_type_name = filename[:-4]  # Remove .wav extension
+            filepath = os.path.join(speech_types_dir, filename)
+            ref_text = open(os.path.join(speech_types_dir, f"{speech_type_name}.txt")).read()
+            speech_types[speech_type_name] = {"audio": filepath, "ref_text": ref_text}
+    return speech_types
