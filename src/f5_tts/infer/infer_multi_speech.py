@@ -2,6 +2,7 @@
 # Above allows ruff to ignore E402: module level import not at top of file
 
 from contextlib import asynccontextmanager
+import io
 import json
 import os
 import random
@@ -10,11 +11,13 @@ import tempfile
 import time
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 import numpy as np
 from pydantic import BaseModel
 import soundfile as sf
 import torchaudio
 import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
 
 from f5_tts.infer.infer_gradio import load_custom, load_e2tts, load_f5tts, parse_speechtypes_text
 from f5_tts.model.utils import seed_everything
@@ -83,7 +86,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def infer(
     ref_audio_orig,
@@ -176,6 +185,10 @@ async def generate_tts(request: TTSRequest):
                 if style == "Laughing":
                     cross_fade_duration=0.1
                     speed=1
+                if style == "Regular":
+                    cross_fade_duration=0.2
+                    speed=1
+
             else:
                 current_style = "Regular"
                 cross_fade_duration=0.2
@@ -223,8 +236,90 @@ async def generate_tts(request: TTSRequest):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@app.post("/streaming_tts/")
+async def streaming_tts(request: TTSRequest):
+    torch.cuda.empty_cache()
+    try:
+        gen_text = request.text
+        remove_silence = request.remove_silence
+        seed = request.seed
+        if seed == -1:
+            seed = random.randint(0, sys.maxsize)
+        seed_everything(seed)
+        segments = parse_speechtypes_text(gen_text)
+
+        generated_audio_segments = []
+        current_style = "Regular"
+
+        for segment in segments:
+            style = segment["style"]
+            text = segment["text"]
+
+            if style in speech_types:
+                current_style = style
+                if style == "Angry":
+                    cross_fade_duration=0.2
+                    speed=1
+                if style == "Sad":
+                    cross_fade_duration=0.2
+                    speed=1
+                if style == "Laughing":
+                    cross_fade_duration=0.1
+                    speed=1
+                if style == "Regular":
+                    cross_fade_duration=0.2
+                    speed=1
+
+            else:
+                current_style = "Regular"
+                cross_fade_duration=0.2
+                speed=1
+
+            ref_audio = speech_types[current_style]["audio"]
+            ref_text = speech_types[current_style].get("ref_text", "")
+
+            audio_out, ref_text_out = infer(
+                ref_audio,
+                ref_text,
+                text,
+                tts_model_choice,
+                remove_silence=remove_silence,
+                cross_fade_duration=cross_fade_duration,
+                speed=speed,
+                show_info=print,
+            )
+            sr, audio_data = audio_out
+            generated_audio_segments.append(audio_data)
+            speech_types[current_style]["ref_text"] = ref_text_out
+
+        # Concatenate all segments
+        final_audio = np.concatenate(generated_audio_segments)
+        
+        # Create final WAV buffer
+        final_buffer = io.BytesIO()
+        sf.write(final_buffer, final_audio, sr, format='WAV')
+        
+        # Return complete audio
+        final_buffer.seek(0)
+        print(f"Seed: {seed}")
+        return Response(
+            content=final_buffer.getvalue(),
+            media_type="audio/wav"
+        )
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=9000,
+        ssl_keyfile="key.pem",
+        ssl_certfile="cert.pem",
+    )
 
 # {
 #   "text": "{Angry} During the match, i was very angry and frustrated with the referee for the tackle on Eduardo. It was a horrible tackle from the Birmingham player which broke his leg... I told the player that he should never be allowed on a football pitch again.\n{Sad} The match completely changed our season in 2008, as we were uhh... scarred, from watching Eduardo being stretchered off the pitch like that. We uhh lost our momentum after that. We were six points ahead of Manchester United in second but in the end, we finished third in May. I sometimes feel very sad you know? because, we had a real chance of winning the championship that season and for Eduardo as well, because uhh it was a horrific injury for a player to suffer.\n{Regular} But that's football, you know? You have to pick yourself up. You don't get time to feel sorry for yourself, you just have to go again the next game because that is the Premier League",

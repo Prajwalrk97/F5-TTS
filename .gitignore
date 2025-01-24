@@ -17,6 +17,9 @@ __pycache__/
 # C extensions
 *.so
 
+#certs
+*.pem
+
 # Distribution / packaging
 .Python
 build/
