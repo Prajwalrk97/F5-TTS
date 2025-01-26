@@ -2,7 +2,6 @@
 # Above allows ruff to ignore E402: module level import not at top of file
 
 import json
-import re
 import tempfile
 from collections import OrderedDict
 from importlib.resources import files
@@ -34,6 +33,7 @@ from f5_tts.model import DiT, UNetT
 from f5_tts.infer.utils_infer import (
     load_vocoder,
     load_model,
+    parse_speechtypes_text,
     preprocess_ref_audio_text,
     infer_process,
     remove_silence_for_generated_wav,
@@ -265,31 +265,6 @@ with gr.Blocks() as app_tts:
     )
 
 
-def parse_speechtypes_text(gen_text):
-    # Pattern to find {speechtype}
-    pattern = r"\{(.*?)\}"
-
-    # Split the text by the pattern
-    tokens = re.split(pattern, gen_text)
-
-    segments = []
-
-    current_style = "Regular"
-
-    for i in range(len(tokens)):
-        if i % 2 == 0:
-            # This is text
-            text = tokens[i].strip()
-            if text:
-                segments.append({"style": current_style, "text": text})
-        else:
-            # This is style
-            style = tokens[i].strip()
-            current_style = style
-
-    return segments
-
-
 with gr.Blocks() as app_multistyle:
     # New section for multistyle generation
     gr.Markdown(
@@ -304,7 +279,7 @@ with gr.Blocks() as app_multistyle:
         gr.Markdown(
             """
             **Example Input:**                                                                      
-            {Regular} Hello, I'd like to order a sandwich please.                                                         
+            {Neutral} Hello, I'd like to order a sandwich please.                                                         
             {Surprised} What do you mean you're out of bread?                                                                      
             {Sad} I really wanted a sandwich though...                                                              
             {Angry} You know what, darn you and your little shop!                                                                       
@@ -327,15 +302,15 @@ with gr.Blocks() as app_multistyle:
         "Upload different audio clips for each speech type. The first speech type is mandatory. You can add additional speech types by clicking the 'Add Speech Type' button."
     )
 
-    # Regular speech type (mandatory)
+    # Neutral speech type (mandatory)
     with gr.Row() as regular_row:
         with gr.Column():
-            regular_name = gr.Textbox(value="Regular", label="Speech Type Name")
+            regular_name = gr.Textbox(value="Neutral", label="Speech Type Name")
             regular_insert = gr.Button("Insert Label", variant="secondary")
-        regular_audio = gr.Audio(label="Regular Reference Audio", type="filepath")
-        regular_ref_text = gr.Textbox(label="Reference Text (Regular)", lines=2)
+        regular_audio = gr.Audio(label="Neutral Reference Audio", type="filepath")
+        regular_ref_text = gr.Textbox(label="Reference Text (Neutral)", lines=2)
 
-    # Regular speech type (max 100)
+    # Neutral speech type (max 100)
     max_speech_types = 100
     speech_type_rows = [regular_row]
     speech_type_names = [regular_name]
@@ -394,7 +369,7 @@ with gr.Blocks() as app_multistyle:
     gen_text_input_multistyle = gr.Textbox(
         label="Text to Generate",
         lines=10,
-        placeholder="Enter the script with speaker names (or emotion types) at the start of each block, e.g.:\n\n{Regular} Hello, I'd like to order a sandwich please.\n{Surprised} What do you mean you're out of bread?\n{Sad} I really wanted a sandwich though...\n{Angry} You know what, darn you and your little shop!\n{Whisper} I'll just go back home and cry now.\n{Shouting} Why me?!",
+        placeholder="Enter the script with speaker names (or emotion types) at the start of each block, e.g.:\n\n{Neutral} Hello, I'd like to order a sandwich please.\n{Surprised} What do you mean you're out of bread?\n{Sad} I really wanted a sandwich though...\n{Angry} You know what, darn you and your little shop!\n{Whisper} I'll just go back home and cry now.\n{Shouting} Why me?!",
     )
 
     def make_insert_speech_type_fn(index):
@@ -453,7 +428,7 @@ with gr.Blocks() as app_multistyle:
 
         # For each segment, generate speech
         generated_audio_segments = []
-        current_style = "Regular"
+        current_style = "Neutral"
 
         for segment in segments:
             style = segment["style"]
@@ -462,8 +437,8 @@ with gr.Blocks() as app_multistyle:
             if style in speech_types:
                 current_style = style
             else:
-                gr.Warning(f"Type {style} is not available, will use Regular as default.")
-                current_style = "Regular"
+                gr.Warning(f"Type {style} is not available, will use Neutral as default.")
+                current_style = "Neutral"
 
             try:
                 ref_audio = speech_types[current_style]["audio"]

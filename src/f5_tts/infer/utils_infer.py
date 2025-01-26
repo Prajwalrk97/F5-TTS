@@ -559,3 +559,69 @@ def load_speech_types(speech_types_dir):
             ref_text = open(os.path.join(speech_types_dir, f"{speech_type_name}.txt")).read()
             speech_types[speech_type_name] = {"audio": filepath, "ref_text": ref_text}
     return speech_types
+
+def parse_speechtypes_text(gen_text):
+    # Pattern to find {speechtype}
+    pattern = r"\{(.*?)\}"
+
+    # Split the text by the pattern
+    tokens = re.split(pattern, gen_text)
+
+    segments = []
+
+    current_style = "Neutral"
+
+    for i in range(len(tokens)):
+        if i % 2 == 0:
+            # This is text
+            text = tokens[i].strip()
+            if text:
+                segments.append({"style": current_style, "text": text})
+        else:
+            # This is style
+            style = tokens[i].strip()
+            current_style = style
+
+    return segments
+
+def split_sentences(text: str) -> list[str]:
+    # Split paragraphs first - handle both \n\n and \n
+    paragraphs = [p.strip() for p in text.replace('\n\n', '\n').split('\n')]
+    sentences = []
+    
+    for paragraph in paragraphs:
+        if not paragraph:
+            continue
+            
+        # Temporarily replace ellipsis and numbers with periods
+        paragraph = re.sub(r'\.{3}', '###', paragraph)
+        paragraph = re.sub(r'(\d+)\.(\d+)', r'\1@@@\2', paragraph)
+        
+        # Split on sentence endings while preserving punctuation
+        # Look for .!? followed by space/quotes/lowercase letter
+        splits = re.split(r'([.!?])(?=\s+|"|\'|[a-z]|$)', paragraph)
+        
+        # Recombine sentences with their punctuation
+        current = ''
+        for i, split in enumerate(splits):
+            if split in '.!?':
+                current += split
+                if current.strip():
+                    # Restore special sequences
+                    current = current.replace('###', '...')
+                    current = current.replace('@@@', '.')
+                    # Clean whitespace
+                    current = ' '.join(current.split())
+                    sentences.append(current)
+                current = ''
+            else:
+                current += split
+                
+        # Add any remaining text
+        if current.strip():
+            current = current.replace('###', '...')
+            current = current.replace('@@@', '.')
+            current = ' '.join(current.split())
+            sentences.append(current)
+    
+    return sentences

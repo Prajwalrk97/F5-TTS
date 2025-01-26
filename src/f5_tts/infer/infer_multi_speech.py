@@ -10,16 +10,19 @@ import sys
 import tempfile
 import time
 
+import pandas as pd
+from transformers import pipeline
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
 import numpy as np
+from datasets import Dataset
 from pydantic import BaseModel
 import soundfile as sf
 import torchaudio
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 
-from f5_tts.infer.infer_gradio import load_custom, load_e2tts, load_f5tts, parse_speechtypes_text
+from f5_tts.infer.infer_gradio import load_custom, load_e2tts, load_f5tts
 from f5_tts.model.utils import seed_everything
 import torch
 try:
@@ -40,9 +43,11 @@ def gpu_decorator(func):
 from f5_tts.infer.utils_infer import (
     load_speech_types,
     load_vocoder,
+    parse_speechtypes_text,
     preprocess_ref_audio_text,
     infer_process,
     remove_silence_for_generated_wav,
+    split_sentences,
 )
 
 
@@ -93,6 +98,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def infer(
     ref_audio_orig,
@@ -154,6 +160,47 @@ def infer(
     return (final_sample_rate, final_wave), ref_text
 
 
+async def generate_emotion_tags(text: str) -> str:
+    sentences = split_sentences(text)
+    df = pd.DataFrame({"text": sentences})
+    dataset = Dataset.from_pandas(df)
+    classifier = pipeline(
+        "text-classification", 
+        model="j-hartmann/emotion-english-distilroberta-base", 
+        top_k=1,
+        device=0    # cuda
+    )
+    
+    def _process_batch(examples):
+        outputs = classifier(examples["text"])
+        return {"emotion": [output[0] for output in outputs]}
+    
+    results = dataset.map(
+        _process_batch,
+        batched=True,
+        batch_size=50
+    )
+    torch.cuda.empty_cache()
+
+    text_with_emotions = ""
+    prev_emotion = ""
+    for item in results:
+        try:
+            cur_emotion = str(item["emotion"]["label"]).strip()
+            if cur_emotion.title() not in speech_types:
+                cur_emotion = "neutral"
+            if prev_emotion == cur_emotion:
+                text_with_emotions += item["text"] + " "
+            else:
+                text_with_emotions += "{" + cur_emotion.title() + "} " + item["text"] + " "
+            prev_emotion = cur_emotion
+        except:
+            text_with_emotions += "{Neutral} " + item["text"] + " "
+            prev_emotion = cur_emotion
+    
+    return text_with_emotions
+
+
 @app.post("/generate_tts/")
 async def generate_tts(request: TTSRequest):
     torch.cuda.empty_cache()
@@ -165,10 +212,13 @@ async def generate_tts(request: TTSRequest):
         if seed == -1:
             seed = random.randint(0, sys.maxsize)
         seed_everything(seed)
-        segments = parse_speechtypes_text(gen_text)
+
+        gen_text_with_emotions = await generate_emotion_tags(gen_text)
+        print(gen_text_with_emotions)
+        segments = parse_speechtypes_text(gen_text_with_emotions)
 
         generated_audio_segments = []
-        current_style = "Regular"
+        current_style = "Neutral"
 
         for segment in segments:
             style = segment["style"]
@@ -179,18 +229,18 @@ async def generate_tts(request: TTSRequest):
                 if style == "Angry":
                     cross_fade_duration=0.2
                     speed=1
-                if style == "Sad":
+                if style == "Sadness":
                     cross_fade_duration=0.2
                     speed=1
                 if style == "Laughing":
                     cross_fade_duration=0.1
                     speed=1
-                if style == "Regular":
+                if style == "Neutral":
                     cross_fade_duration=0.2
                     speed=1
 
             else:
-                current_style = "Regular"
+                current_style = "Neutral"
                 cross_fade_duration=0.2
                 speed=1
 
@@ -246,10 +296,12 @@ async def streaming_tts(request: TTSRequest):
         if seed == -1:
             seed = random.randint(0, sys.maxsize)
         seed_everything(seed)
-        segments = parse_speechtypes_text(gen_text)
+
+        gen_text_with_emotions = await generate_emotion_tags(gen_text)
+        segments = parse_speechtypes_text(gen_text_with_emotions)
 
         generated_audio_segments = []
-        current_style = "Regular"
+        current_style = "Neutral"
 
         for segment in segments:
             style = segment["style"]
@@ -260,18 +312,18 @@ async def streaming_tts(request: TTSRequest):
                 if style == "Angry":
                     cross_fade_duration=0.2
                     speed=1
-                if style == "Sad":
+                if style == "Sadness":
                     cross_fade_duration=0.2
                     speed=1
                 if style == "Laughing":
                     cross_fade_duration=0.1
                     speed=1
-                if style == "Regular":
+                if style == "Neutral":
                     cross_fade_duration=0.2
                     speed=1
 
             else:
-                current_style = "Regular"
+                current_style = "Neutral"
                 cross_fade_duration=0.2
                 speed=1
 
@@ -322,7 +374,7 @@ if __name__ == "__main__":
     )
 
 # {
-#   "text": "{Angry} During the match, i was very angry and frustrated with the referee for the tackle on Eduardo. It was a horrible tackle from the Birmingham player which broke his leg... I told the player that he should never be allowed on a football pitch again.\n{Sad} The match completely changed our season in 2008, as we were uhh... scarred, from watching Eduardo being stretchered off the pitch like that. We uhh lost our momentum after that. We were six points ahead of Manchester United in second but in the end, we finished third in May. I sometimes feel very sad you know? because, we had a real chance of winning the championship that season and for Eduardo as well, because uhh it was a horrific injury for a player to suffer.\n{Regular} But that's football, you know? You have to pick yourself up. You don't get time to feel sorry for yourself, you just have to go again the next game because that is the Premier League",
+#   "text": "During the match, i was very angry and frustrated with the referee for the tackle on Eduardo. It was a horrible tackle from the Birmingham player which broke his leg... I told the player that he should never be allowed on a football pitch again.\nThe match completely changed our season in 2008, as we were uhh... scarred, from watching Eduardo being stretchered off the pitch like that. We uhh lost our momentum after that. We were six points ahead of Manchester United in second but in the end, we finished third in May. I sometimes feel very Sadness you know? because, we had a real chance of winning the championship that season and for Eduardo as well, because uhh it was a horrific injury for a player to suffer.\nBut that's football, you know? You have to pick yourself up. You don't get time to feel sorry for yourself, you just have to go again the next game because that is the Premier League",
 #   "remove_silence": false,
 #   "seed": -1
 # }
