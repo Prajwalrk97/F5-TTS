@@ -1,6 +1,7 @@
 # A unified script for inference process
 # Make adjustments inside functions, and consider both gradio and cli scripts if need to change func output format
 from collections import OrderedDict
+import io
 import os
 import sys
 
@@ -21,6 +22,11 @@ import numpy as np
 import torch
 import torchaudio
 import tqdm
+from fastapi import FastAPI
+import uuid
+import numpy as np
+from loguru import logger
+import soundfile as sf
 from huggingface_hub import snapshot_download, hf_hub_download
 from pydub import AudioSegment, silence
 from transformers import pipeline
@@ -54,6 +60,37 @@ speed = 1.0
 fix_duration = None
 
 # -----------------------------------------
+
+
+async def postgres_async_update(
+    app: FastAPI,
+    message_id: uuid.UUID,
+    message_audio: np.ndarray,
+    seed: str,
+    samplerate: int = 24000
+) -> bool:
+    """
+    Update message audio (as compressed binary) and seed for given message_id
+    Returns True if update successful, False otherwise
+    """
+    try:
+        # Convert to WAV bytes directly
+        wav_buffer = io.BytesIO()
+        sf.write(wav_buffer, message_audio, samplerate, format='WAV', subtype='PCM_16')
+        wav_bytes = wav_buffer.getvalue()
+
+        async with app.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE arsene_tts_chat_history
+                SET message_audio = $2, tts_seed = $3
+                WHERE message_id = $1
+                """,
+                message_id, wav_bytes, seed
+            )
+
+    except Exception as e:
+        logger.error(f"Error storing audio for message {message_id}: {e}")
 
 
 # chunk text into smaller pieces
@@ -588,19 +625,19 @@ def split_sentences(text: str) -> list[str]:
     # Split paragraphs first - handle both \n\n and \n
     paragraphs = [p.strip() for p in text.replace('\n\n', '\n').split('\n')]
     sentences = []
-    
+
     for paragraph in paragraphs:
         if not paragraph:
             continue
-            
+
         # Temporarily replace ellipsis and numbers with periods
         paragraph = re.sub(r'\.{3}', '###', paragraph)
         paragraph = re.sub(r'(\d+)\.(\d+)', r'\1@@@\2', paragraph)
-        
+
         # Split on sentence endings while preserving punctuation
         # Look for .!? followed by space/quotes/lowercase letter
         splits = re.split(r'([.!?])(?=\s+|"|\'|[a-z]|$)', paragraph)
-        
+
         # Recombine sentences with their punctuation
         current = ''
         for i, split in enumerate(splits):
@@ -616,12 +653,12 @@ def split_sentences(text: str) -> list[str]:
                 current = ''
             else:
                 current += split
-                
+
         # Add any remaining text
         if current.strip():
             current = current.replace('###', '...')
             current = current.replace('@@@', '.')
             current = ' '.join(current.split())
             sentences.append(current)
-    
+
     return sentences

@@ -9,20 +9,27 @@ import random
 import sys
 import tempfile
 import time
-
+import uuid
+import asyncpg
 import pandas as pd
-from transformers import pipeline
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import Response
 import numpy as np
-from datasets import Dataset
-from pydantic import BaseModel
 import soundfile as sf
 import torchaudio
 import uvicorn
+
+from transformers import pipeline
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from datasets import Dataset
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
 from fastapi.middleware.cors import CORSMiddleware
 
 from f5_tts.infer.infer_gradio import load_custom, load_e2tts, load_f5tts
+from f5_tts.infer.utils_infer import postgres_async_update
 from f5_tts.model.utils import seed_everything
 import torch
 try:
@@ -31,13 +38,6 @@ try:
     USING_SPACES = True
 except ImportError:
     USING_SPACES = False
-
-
-def gpu_decorator(func):
-    if USING_SPACES:
-        return spaces.GPU(func)
-    else:
-        return func
 
 
 from f5_tts.infer.utils_infer import (
@@ -50,9 +50,18 @@ from f5_tts.infer.utils_infer import (
     split_sentences,
 )
 
+load_dotenv()
+
+POSTGRES_USER = os.getenv("POSTGRES_USER")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+POSTGRES_DB = os.getenv("POSTGRES_DB")
+POSTGRES_HOST = os.getenv("POSTGRES_HOST")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT")
+POSTGRES_TABLE = os.getenv("POSTGRES_TABLE")
 
 DEFAULT_TTS_MODEL = "F5-TTS"
-tts_model_choice = DEFAULT_TTS_MODEL
+USING_SPACES = False
+TTS_MODEL_CHOICE = DEFAULT_TTS_MODEL
 SPEECH_TYPES_DIRECTORY = "ref_audio"
 DEFAULT_TTS_MODEL_CFG = [
     "hf://prajwalrk/arsene-wenger-tts/model_160000.safetensors",
@@ -61,33 +70,26 @@ DEFAULT_TTS_MODEL_CFG = [
 ]
 
 
-class TTSRequest(BaseModel):
-    text: str
-    remove_silence: bool = False
-    seed: int = -1
-
-custom_ema_model, pre_custom_path = None, ""
-chat_model_state = None
-chat_tokenizer_state = None
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifecycle and resource initialization."""
-    global speech_types
-    global vocoder
-    global F5TTS_ema_model
-    global E2TTS_ema_model
     try:
-        speech_types = load_speech_types(SPEECH_TYPES_DIRECTORY)
+        app.speech_types = load_speech_types(SPEECH_TYPES_DIRECTORY)
         
         # load models
-        vocoder = load_vocoder()
-        F5TTS_ema_model = load_f5tts()
-        E2TTS_ema_model = load_e2tts() if USING_SPACES else None
+        app.vocoder = load_vocoder()
+        app.F5TTS_ema_model = load_f5tts()
+        app.E2TTS_ema_model = load_e2tts() if USING_SPACES else None
+        app.pool = await asyncpg.create_pool(
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            database=POSTGRES_DB,
+            host=POSTGRES_HOST,
+        )
         yield
     finally:
-        pass
+        if hasattr(app, 'pool'):
+            await app.pool.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -98,6 +100,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class TTSRequest(BaseModel):
+    text: str
+    message_id: uuid.UUID = uuid.uuid4()
+    remove_silence: bool = False
+    seed: int = -1
+
+custom_ema_model, pre_custom_path = None, ""
+chat_model_state = None
+chat_tokenizer_state = None
+
+
 
 
 def infer(
@@ -122,9 +137,9 @@ def infer(
     )
 
     if model == "F5-TTS":
-        ema_model = F5TTS_ema_model
+        ema_model = app.F5TTS_ema_model
     elif model == "E2-TTS":
-        ema_model = E2TTS_ema_model
+        ema_model = app.E2TTS_ema_model
     elif isinstance(model, list) and model[0] == "Custom":
         global custom_ema_model, pre_custom_path
         if pre_custom_path != model[1]:
@@ -142,7 +157,7 @@ def infer(
         ref_text,
         gen_text,
         ema_model,
-        vocoder,
+        app.vocoder,
         cross_fade_duration=cross_fade_duration,
         nfe_step=nfe_step,
         speed=speed,
@@ -187,7 +202,7 @@ async def generate_emotion_tags(text: str) -> str:
     for item in results:
         try:
             cur_emotion = str(item["emotion"]["label"]).strip()
-            if cur_emotion.title() not in speech_types:
+            if cur_emotion.title() not in app.speech_types:
                 cur_emotion = "neutral"
             if prev_emotion == cur_emotion:
                 text_with_emotions += item["text"] + " "
@@ -202,11 +217,12 @@ async def generate_emotion_tags(text: str) -> str:
 
 
 @app.post("/generate_tts/")
-async def generate_tts(request: TTSRequest):
+async def generate_tts(request: TTSRequest, background_tasks: BackgroundTasks):
     torch.cuda.empty_cache()
     start_time = time.time()
     try:
         gen_text = request.text
+        message_id = request.message_id
         remove_silence = request.remove_silence
         seed = request.seed
         if seed == -1:
@@ -224,7 +240,7 @@ async def generate_tts(request: TTSRequest):
             style = segment["style"]
             text = segment["text"]
 
-            if style in speech_types:
+            if style in app.speech_types:
                 current_style = style
                 if style == "Angry":
                     cross_fade_duration=0.2
@@ -244,14 +260,14 @@ async def generate_tts(request: TTSRequest):
                 cross_fade_duration=0.2
                 speed=1
 
-            ref_audio = speech_types[current_style]["audio"]
-            ref_text = speech_types[current_style].get("ref_text", "")
+            ref_audio = app.speech_types[current_style]["audio"]
+            ref_text = app.speech_types[current_style].get("ref_text", "")
 
             audio_out, ref_text_out = infer(
                 ref_audio,
                 ref_text,
                 text,
-                tts_model_choice,
+                TTS_MODEL_CHOICE,
                 remove_silence=remove_silence,
                 cross_fade_duration=cross_fade_duration,
                 speed=speed,
@@ -259,7 +275,7 @@ async def generate_tts(request: TTSRequest):
             )
             sr, audio_data = audio_out
             generated_audio_segments.append(audio_data)
-            speech_types[current_style]["ref_text"] = ref_text_out
+            app.speech_types[current_style]["ref_text"] = ref_text_out
 
         if generated_audio_segments:
             final_audio_data = np.concatenate(generated_audio_segments)
@@ -270,7 +286,15 @@ async def generate_tts(request: TTSRequest):
 
             os.makedirs(output_directory, exist_ok=True)
             sf.write(output_path, final_audio_data, sr)
-
+            print(f"Seed: {seed}")
+            print(f"Sample rate: {sr}")
+            # background_tasks.add_task(
+            #     postgres_async_update,
+            #     app=app,
+            #     message_id=message_id,
+            #     message_audio=final_audio_data,
+            #     seed=str(seed)
+            # )
             return {
                 "message": "TTS generation successful",
                 "filepath": output_filename,
@@ -287,10 +311,11 @@ async def generate_tts(request: TTSRequest):
 
 
 @app.post("/streaming_tts/")
-async def streaming_tts(request: TTSRequest):
+async def streaming_tts(request: TTSRequest, background_tasks: BackgroundTasks):
     torch.cuda.empty_cache()
     try:
         gen_text = request.text
+        message_id = request.message_id
         remove_silence = request.remove_silence
         seed = request.seed
         if seed == -1:
@@ -307,34 +332,34 @@ async def streaming_tts(request: TTSRequest):
             style = segment["style"]
             text = segment["text"]
 
-            if style in speech_types:
+            if style in app.speech_types:
                 current_style = style
                 if style == "Angry":
                     cross_fade_duration=0.2
                     speed=1
                 if style == "Sadness":
                     cross_fade_duration=0.2
-                    speed=1
+                    speed=0.9
                 if style == "Laughing":
                     cross_fade_duration=0.1
                     speed=1
                 if style == "Neutral":
                     cross_fade_duration=0.2
-                    speed=1
+                    speed=0.9
 
             else:
                 current_style = "Neutral"
                 cross_fade_duration=0.2
-                speed=1
+                speed=0.9
 
-            ref_audio = speech_types[current_style]["audio"]
-            ref_text = speech_types[current_style].get("ref_text", "")
+            ref_audio = app.speech_types[current_style]["audio"]
+            ref_text = app.speech_types[current_style].get("ref_text", "")
 
             audio_out, ref_text_out = infer(
                 ref_audio,
                 ref_text,
                 text,
-                tts_model_choice,
+                TTS_MODEL_CHOICE,
                 remove_silence=remove_silence,
                 cross_fade_duration=cross_fade_duration,
                 speed=speed,
@@ -342,21 +367,33 @@ async def streaming_tts(request: TTSRequest):
             )
             sr, audio_data = audio_out
             generated_audio_segments.append(audio_data)
-            speech_types[current_style]["ref_text"] = ref_text_out
+            app.speech_types[current_style]["ref_text"] = ref_text_out
 
         # Concatenate all segments
         final_audio = np.concatenate(generated_audio_segments)
         
         # Create final WAV buffer
         final_buffer = io.BytesIO()
-        sf.write(final_buffer, final_audio, sr, format='WAV')
-        
-        # Return complete audio
+        # sf.write(final_buffer, final_audio, sr, format='WAV')
+        sf.write(final_buffer, final_audio, sr, format='WAV', subtype='PCM_16')
         final_buffer.seek(0)
+
         print(f"Seed: {seed}")
+        print(f"Sample rate: {sr}")
+        background_tasks.add_task(
+                postgres_async_update,
+                app=app,
+                message_id=message_id,
+                message_audio=final_audio,
+                seed=str(seed)
+            )
         return Response(
             content=final_buffer.getvalue(),
-            media_type="audio/wav"
+            media_type="audio/wav",
+            headers={
+                'Content-Type': 'audio/wav',
+                'Content-Disposition': 'attachment; filename="audio.wav"'
+            }
         )
 
     except ValueError as e:
@@ -372,9 +409,3 @@ if __name__ == "__main__":
         ssl_keyfile="key.pem",
         ssl_certfile="cert.pem",
     )
-
-# {
-#   "text": "During the match, i was very angry and frustrated with the referee for the tackle on Eduardo. It was a horrible tackle from the Birmingham player which broke his leg... I told the player that he should never be allowed on a football pitch again.\nThe match completely changed our season in 2008, as we were uhh... scarred, from watching Eduardo being stretchered off the pitch like that. We uhh lost our momentum after that. We were six points ahead of Manchester United in second but in the end, we finished third in May. I sometimes feel very Sadness you know? because, we had a real chance of winning the championship that season and for Eduardo as well, because uhh it was a horrific injury for a player to suffer.\nBut that's football, you know? You have to pick yourself up. You don't get time to feel sorry for yourself, you just have to go again the next game because that is the Premier League",
-#   "remove_silence": false,
-#   "seed": -1
-# }
